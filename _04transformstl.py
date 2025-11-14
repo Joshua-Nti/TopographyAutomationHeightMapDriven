@@ -1,11 +1,11 @@
-# _04transformstl.py
+# _04transformstl.py (column-freeze + heightmap visualization for multiple models)
 import os
 import time
 import numpy as np
 from math import radians, sin, cos, pi
 from stl import mesh
 from scipy.ndimage import distance_transform_edt as edt
-
+import matplotlib.pyplot as plt
 
 # ---------------- utils ----------------
 
@@ -95,6 +95,20 @@ def _smoothstep_cos(t):
     t = np.clip(t, 0.0, 1.0)
     return 0.5 - 0.5*cos(pi*t)
 
+def _triangulate_heightfield(X, Y, Z):
+    """Convert (X,Y,Z) grid into triangles for STL visualization."""
+    ny, nx = X.shape
+    tris = []
+    for j in range(ny - 1):
+        for i in range(nx - 1):
+            p1 = [X[j, i],     Y[j, i],     Z[j, i]]
+            p2 = [X[j, i+1],   Y[j, i+1],   Z[j, i+1]]
+            p3 = [X[j+1, i+1], Y[j+1, i+1], Z[j+1, i+1]]
+            p4 = [X[j+1, i],   Y[j+1, i],   Z[j+1, i]]
+            tris.append([p1, p2, p3])
+            tris.append([p1, p3, p4])
+    return np.asarray(tris, dtype=np.float64)
+
 
 # ---------------- main API ----------------
 
@@ -104,26 +118,26 @@ def transformSTL(in_body, in_transform, out_dir,
                  blend_mm=0.35, margin_mm=0.0):
     """
     Deform (lift/warp) an STL mesh 'in_body' using the embedded COLUMN-FREEZE
-    heightmap math (no external surface). The legacy 'in_transform' argument is
-    accepted for compatibility but IGNORED.
-
-    Output is written to 'out_dir' with the same base filename.
+    heightmap math (no external surface). Exports per-model heightmap:
+      - heightmap_<model>.npy
+      - heightmap_<model>_preview.stl
+      - heightmap_<model>.png (2D color plot)
+    plus the deformed STL itself.
     """
     start = time.time()
-    print("[transformSTL] START (embedded column-freeze)")
-    print(f"[transformSTL]   in_body      = {in_body}")
-    if in_transform is not None:
-        print("[transformSTL]   NOTE: 'in_transform' provided but ignored (column-freeze mode)")
-    print(f"[transformSTL]   out_dir      = {out_dir}")
-    print(f"[transformSTL]   params       = grid={grid_nx}x{grid_ny}  z_tol={z_tol}  "
-          f"blend_mm={blend_mm}  angle={angle_deg}°  margin={margin_mm}")
+    base_name = os.path.splitext(os.path.basename(in_body))[0]
 
-    # --- Load STL to be deformed -------------------------------------------
+    print("[transformSTL] START (column-freeze + heightmap export)")
+    print(f"  model  = {base_name}")
+    print(f"  in_body = {in_body}")
+    print(f"  out_dir = {out_dir}")
+    print(f"  grid={grid_nx}x{grid_ny}  z_tol={z_tol}  blend={blend_mm}  angle={angle_deg}°")
+
+    # --- Load STL ----------------------------------------------------------
     m_in = mesh.Mesh.from_file(in_body)
-    Vtri = m_in.vectors.copy()             # (T,3,3)
-    V = Vtri.reshape(-1, 3)                # (N,3)
+    Vtri = m_in.vectors.copy()
+    V = Vtri.reshape(-1, 3)
 
-    # Bounding box & base
     xmin = float(V[:,0].min()); xmax = float(V[:,0].max())
     ymin = float(V[:,1].min()); ymax = float(V[:,1].max())
     zmin = float(V[:,2].min())
@@ -132,25 +146,60 @@ def transformSTL(in_body, in_transform, out_dir,
         xmin -= margin_mm; ymin -= margin_mm
         xmax += margin_mm; ymax += margin_mm
 
-    # --- Build XY grid over footprint --------------------------------------
+    # --- Build grid --------------------------------------------------------
     X, Y = _grid_over_bbox(xmin, xmax, ymin, ymax, int(grid_nx), int(grid_ny))
     dx = (xmax - xmin) / max(int(grid_nx) - 1, 1)
     dy = (ymax - ymin) / max(int(grid_ny) - 1, 1)
 
-    # --- Supported mask at the cut plane -----------------------------------
+    # --- Supported mask ----------------------------------------------------
     supported = _rasterize_supported_mask(Vtri, X, Y, zmin, float(z_tol))
     if not supported.any():
         raise RuntimeError("No supported footprint found. Try increasing z_tol slightly.")
 
-    # --- Outside distance field (mm) ----------------------------------------
-    dist_out = edt(~supported, sampling=(dy, dx))  # (ny,nx)
+    # --- Distance field = raw heightmap (mm) -------------------------------
+    dist_out = edt(~supported, sampling=(dy, dx))  # 2D field of distances
+    s = sin(radians(angle_deg))
+    heightmap = dist_out * s
+    heightmap[supported] = 0.0
+
+    # --- Export heightmap data & STL preview -------------------------------
+    os.makedirs(out_dir, exist_ok=True)
+
+    npy_path = os.path.join(out_dir, f"heightmap_{base_name}.npy")
+    np.save(npy_path, heightmap)
+
+    tris = _triangulate_heightfield(X, Y, heightmap)
+    hm_mesh = mesh.Mesh(np.zeros(tris.shape[0], dtype=mesh.Mesh.dtype))
+    hm_mesh.vectors[:] = tris
+    hm_stl_path = os.path.join(out_dir, f"heightmap_{base_name}_preview.stl")
+    hm_mesh.save(hm_stl_path)
+
+    print(f"[transformSTL]   Heightmap NPY     → {npy_path}")
+    print(f"[transformSTL]   Heightmap preview → {hm_stl_path}")
+
+    # --- Plot heightmap and save PNG ---------------------------------------
+    fig, ax = plt.subplots(figsize=(6, 5))
+    # extent maps array indices back to world X/Y for nicer axes
+    im = ax.imshow(heightmap,
+                   origin='lower',
+                   extent=[xmin, xmax, ymin, ymax],
+                   aspect='equal')
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Height [mm]")
+    ax.set_title(f"Heightmap for {base_name}")
+    ax.set_xlabel("X [mm]")
+    ax.set_ylabel("Y [mm]")
+    fig.tight_layout()
+    png_path = os.path.join(out_dir, f"heightmap_{base_name}.png")
+    fig.savefig(png_path, dpi=200)
+    plt.close(fig)
+
+    print(f"[transformSTL]   Heightmap plot   → {png_path}")
 
     # --- Column-freeze deformation -----------------------------------------
-    s = sin(radians(angle_deg))
-    blend = max(1e-6, float(blend_mm))  # guard
-
-    # nearest-cell lookup for mask
+    blend = max(1e-6, float(blend_mm))
     ny, nx = supported.shape
+
     def mask_at(x, y):
         u = int(round((x - xmin) / dx))
         v = int(round((y - ymin) / dy))
@@ -161,50 +210,43 @@ def transformSTL(in_body, in_transform, out_dir,
     V_new = V.copy()
     for idx in range(V.shape[0]):
         x, y, z = V[idx]
-
-        # Freeze any column whose (x,y) lies inside supported XY footprint
-        if mask_at(x, y):
+        if mask_at(x, y):  # freeze columns above supported XY
             continue
-
-        # Distance from supported boundary (bilinear sampled)
         d = _bilinear_sample(dist_out, x, y, xmin, ymin, dx, dy)
-
-        # Smooth ramp from 0 at boundary to 1 past blend_mm
         w = _smoothstep_cos(d / blend)
-
         dz = (d * s) * w
         V_new[idx, 2] = z + dz
 
-    # --- Save deformed STL --------------------------------------------------
+    # --- Save deformed STL -------------------------------------------------
     new_vecs = V_new.reshape((-1, 3, 3))
     out_mesh = mesh.Mesh(np.zeros(new_vecs.shape[0], dtype=mesh.Mesh.dtype))
     out_mesh.vectors[:] = new_vecs
 
-    os.makedirs(out_dir, exist_ok=True)
     file_name = os.path.basename(in_body)
     output_path = os.path.join(out_dir, file_name)
     out_mesh.save(output_path)
 
     end = time.time()
-    print(f"[transformSTL]   WROTE: {output_path}")
-    print(f"[transformSTL]   DONE in {end - start:.2f}s")
-    print("[transformSTL] END\n")
+    print(f"[transformSTL]   Deformed STL     → {output_path}")
+    print(f"[transformSTL]   DONE in {end - start:.2f}s\n")
     return output_path
 
 
 # ---------------------------------------------------------------------------
-# Standalone test hook
+# Batch run for test_2, test_4, test_5
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    example_in_body      = os.path.join("stl_parts", "test_2.stl")
-    example_in_transform = os.path.join("tf_surfaces", "ignored_surface.stl")  # ignored
-    example_out_dir      = "stl_tf"
+    example_out_dir = os.path.join("stl_tf")
 
-    transformSTL(
-        in_body=example_in_body,
-        in_transform=example_in_transform,  # compat, ignored
-        out_dir=example_out_dir,
-        grid_nx=420, grid_ny=420,
-        z_tol=0.05, angle_deg=20.0,
-        blend_mm=0.35, margin_mm=0.0
-    )
+    for name in ["test_2.stl", "test_4.stl", "test_5.stl"]:
+        in_body = os.path.join("stl_parts", name)
+        transformSTL(
+            in_body=in_body,
+            in_transform=None,          # kept for legacy API, ignored internally
+            out_dir=example_out_dir,
+            grid_nx=420, grid_ny=420,
+            z_tol=0.05,
+            angle_deg=20.0,
+            blend_mm=0.35,
+            margin_mm=0.0,
+        )
