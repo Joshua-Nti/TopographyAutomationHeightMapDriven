@@ -178,7 +178,7 @@ def sliceTransform(
 
     # Per-part paths
     stl_part    = os.path.join(folder["stl_parts"],  base + ".stl")
-    stl_coarse  = os.path.join(folder["stl_coarse"], base + ".stl")
+    stl_coarse  = os.path.join(folder["stl_parts"],  base + ".stl")
     stl_tf      = os.path.join(folder["stl_tf"],     base + ".stl")
     gcode_tf    = os.path.join(folder["gcode_tf"],   base + ".gcode")
     gcode_final = os.path.join(folder["gcode_parts"], base + ".gcode")
@@ -383,7 +383,7 @@ def main(input_stl: str):
     combineGCode(folders["gcode_parts"], combined_path)
 
     # 6. Optional final XY shift on the whole merged toolpath
-    shifted_path = os.path.join(folders["root"], base + "_moved.gcode")
+    shifted_path = os.path.join(base + "_moved.gcode")
 
     if PIPELINE_CONFIG.get("apply_final_shift", False):
         print("\n=== Applying final XY shift ===")
