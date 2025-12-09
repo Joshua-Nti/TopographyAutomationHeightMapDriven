@@ -74,7 +74,6 @@ def make_folder_dict(base_name):
     return {
         "root":         os.path.join(root_dir),
         "stl_parts":    os.path.join(root_dir, "stl_parts"),
-        "stl_coarse":   os.path.join(root_dir, "stl_coarse"),
         "stl_tf":       os.path.join(root_dir, "stl_tf"),
         "tf_surfaces":  os.path.join(root_dir, "tf_surfaces"),
         "gcode_tf":     os.path.join(root_dir, "gcode_tf"),
@@ -95,7 +94,7 @@ GEOMETRY_CONFIG = {
     # Max XY length [mm] of each linear toolpath subsegment after subdivision
     # during backtransform. Smaller = more accurate following of surface,
     # but more G-code.
-    "maximal_segment_length_mm": 2.0,
+    "maximal_segment_length_mm": 1.0,
 
     # Angle tolerance [deg] for detecting downward-facing triangles.
     # Triangles whose normal is within this angle of -Z (downwards) are "critical".
@@ -103,7 +102,7 @@ GEOMETRY_CONFIG = {
 
     # Feedrate [mm/min] for perimeters above downward-facing regions.
     # We inject F<slow_feedrate> once when entering the slow zone.
-    "slow_feedrate_mm_per_min": 180.0,
+    "slow_feedrate_mm_per_min": 360.0,
 
     # Minimal allowed Z after backtransform. This clamps the toolpath upward
     # to avoid diving below a desired safety plane.
@@ -214,18 +213,25 @@ SLICER_CONFIG = {
 
     # Tuning for transformed (nonplanar) parts.
     "transformed_extra_args": [
+        "--perimeter-speed", "15",
+        "--external-perimeter-speed", "12",
+          #  "--bridge-speed", "3",
+          #  "--infill-speed", "50",
+          #   "--solid-infill-speed", "40",
+          #   "--top-solid-infill-speed", "30",
+          #  "--overhangs-speed", "3",
 
         "--bridge-flow-ratio", "0.5",
 
-        "--extrusion-width", "0.3",
-        "--perimeter-extrusion-width", "0.3",
-        "--external-perimeter-extrusion-width", "0.3",
-        "--infill-extrusion-width", "0.3",
-        "--solid-infill-extrusion-width", "0.3",
-        "--top-infill-extrusion-width", "0.3",
+        "--extrusion-width", "0.4",
+        "--perimeter-extrusion-width", "0.4",
+        "--external-perimeter-extrusion-width", "0.4",
+        "--infill-extrusion-width", "0.4",
+        "--solid-infill-extrusion-width", "0.4",
+        "--top-infill-extrusion-width", "0.4",
 
-        "--perimeters", "4",
-        "--extrusion-multiplier", "0.9",
+        "--perimeters", "3",
+        "--extrusion-multiplier", "0.97",
         "--solid-infill-below-area", "0",
 
         "--bottom-solid-layers", "1",

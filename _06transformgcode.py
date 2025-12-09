@@ -35,7 +35,11 @@ from scipy.ndimage import distance_transform_edt as edt
 # Max segment length (XY) for pre-segmentation of test_4.gcode.
 # This only affects test/gcode_parts/test_4.gcode.
 PRESEG_MAX_LEN = 0.25
-SEGMENT_TOGGLE = True
+SEGMENT_TOGGLE = False
+
+# Global ramp length for feedrate transitions (number of motion lines
+# used to smooth fast->slow and slow->fast feedrate jumps).
+FEEDRATE_RAMP_LEN = 7  # you can set this to 3, 5, 7, ...
 
 def _should_presegment(in_file: str) -> bool:
     """
@@ -399,6 +403,172 @@ def extract_feedrate(row):
         return None
 
 
+
+def smooth_feedrate_transitions(lines, slow_feedrate, ramp_len=None):
+    """
+    Post-process a list of G-code lines and smooth abrupt feedrate jumps
+
+    1) FAST -> SLOW (deceleration):
+       - Detect transitions from a higher feedrate down to `slow_feedrate`.
+       - Apply a backward ramp over up to `ramp_len` motion lines
+         (previous lines + the first slow line).
+       - This keeps the slow region itself at `slow_feedrate`.
+
+    2) SLOW -> FAST (acceleration):
+       - Detect transitions from `slow_feedrate` to a higher feedrate.
+       - If there is another explicit slow feedrate soon after (within about
+         2 * ramp_len motion lines), we SKIP the acceleration ramp and let the
+         later deceleration ramp handle the transition.
+       - Otherwise, apply a forward ramp over up to `ramp_len` motion lines
+         (starting at the first faster line).
+
+    If ramp_len is None, FEEDRATE_RAMP_LEN is used.
+    """
+    if ramp_len is None:
+        ramp_len = FEEDRATE_RAMP_LEN
+
+    EPS = 1e-6
+
+    # Work on a modifiable copy
+    out = list(lines)
+
+    # ----------------------------------------------------------------------
+    # PASS 1: FAST -> SLOW (backward ramp)
+    # ----------------------------------------------------------------------
+    last_F = None
+
+    for i in range(len(out)):
+        line = out[i]
+        F_here = extract_feedrate(line)
+
+        if F_here is not None:
+            # Detect jump from fast -> exactly slow_feedrate
+            if (
+                last_F is not None
+                and last_F > slow_feedrate + EPS
+                and abs(F_here - slow_feedrate) < EPS
+            ):
+                # We want to ramp backwards over up to 'ramp_len' motion lines:
+                # some previous G0/G1 lines (fast) + this first slow line.
+                ramp_indices = []
+
+                j = i
+                while j >= 0 and len(ramp_indices) < ramp_len:
+                    l_j = out[j]
+                    stripped_j = l_j.lstrip()
+                    if stripped_j.startswith("G0") or stripped_j.startswith("G1"):
+                        ramp_indices.append(j)
+                    j -= 1
+
+                # ramp_indices currently in descending order -> sort ascending
+                ramp_indices.sort()
+                total = len(ramp_indices)
+
+                if total > 0:
+                    F_start = last_F
+                    F_target = slow_feedrate
+
+                    for k, idx in enumerate(ramp_indices):
+                        t = float(k + 1) / float(total)  # 1/total .. 1
+                        F_k = F_start + (F_target - F_start) * t
+                        out[idx] = clean_and_set_feedrate(out[idx], F_k)
+
+                    # After the ramp, effective feedrate is slow
+                    last_F = slow_feedrate
+                else:
+                    # No valid motion lines found; just keep the explicit slow feed
+                    last_F = F_here
+            else:
+                # Normal update of last_F
+                last_F = F_here
+
+    # ----------------------------------------------------------------------
+    # PASS 2: SLOW -> FAST (forward ramp with lookahead)
+    # ----------------------------------------------------------------------
+    result = out
+    last_F = None
+    i = 0
+    n = len(result)
+
+    while i < n:
+        line = result[i]
+        F_here = extract_feedrate(line)
+
+        if F_here is not None:
+            # Detect jump from slow -> faster
+            if (
+                last_F is not None
+                and abs(last_F - slow_feedrate) < EPS
+                and F_here > slow_feedrate + EPS
+            ):
+                # Look ahead: is there another explicit slow feedrate
+                # within about 2 * ramp_len motion lines?
+                motion_seen = 0
+                next_slow_index = None
+                j = i + 1
+
+                while j < n and motion_seen < 2 * ramp_len:
+                    l_j = result[j]
+                    stripped_j = l_j.lstrip()
+                    if stripped_j.startswith("G0") or stripped_j.startswith("G1"):
+                        motion_seen += 1
+                        F_j = extract_feedrate(l_j)
+                        if F_j is not None and abs(F_j - slow_feedrate) < EPS:
+                            next_slow_index = j
+                            break
+                    j += 1
+
+                if next_slow_index is not None and motion_seen < 2 * ramp_len:
+                    # Not enough room for a full accel ramp AND a clean decel
+                    # ramp before the next slow region.
+                    # In this case, we KEEP the slow speed and do NOT jump up:
+                    # overwrite this faster F with slow_feedrate.
+                    result[i] = clean_and_set_feedrate(result[i], slow_feedrate)
+                    last_F = slow_feedrate
+                    i += 1
+                    continue
+
+
+                # Otherwise: perform normal forward ramp from slow -> F_here
+                F_start = slow_feedrate
+                F_target = F_here
+
+                ramp_indices = []
+                j = i
+                while j < n and len(ramp_indices) < ramp_len:
+                    l_j = result[j]
+                    stripped_j = l_j.lstrip()
+                    if stripped_j.startswith("G0") or stripped_j.startswith("G1"):
+                        ramp_indices.append(j)
+                    j += 1
+
+                total = len(ramp_indices)
+                if total > 0:
+                    for k, idx in enumerate(ramp_indices):
+                        t = float(k + 1) / float(total)  # 1/total .. 1
+                        F_k = F_start + (F_target - F_start) * t
+                        result[idx] = clean_and_set_feedrate(result[idx], F_k)
+
+                    last_F = F_target
+                    i = ramp_indices[-1] + 1
+                    continue
+                else:
+                    # No motion lines to ramp; just set the faster feed here
+                    result[i] = clean_and_set_feedrate(result[i], F_target)
+                    last_F = F_target
+                    i += 1
+                    continue
+            else:
+                # Normal explicit feedrate update (no ramp)
+                last_F = F_here
+
+        # No feedrate on this line, keep last_F as-is
+        i += 1
+
+    return result
+
+
+
 # ---------------------------------------------------------------------------
 # Core: backtransform_data using HEIGHTMAP Δz(x,y)
 # ---------------------------------------------------------------------------
@@ -759,12 +929,22 @@ def transformGCode(
     )
     data_bt_string = ''.join(data_bt)
 
+    # 4b) Smooth global feedrate transitions (fast <-> slow)
+    lines = data_bt_string.splitlines(keepends=True)
+    lines_smoothed = smooth_feedrate_transitions(
+        lines,
+        slow_feedrate=slow_feedrate,
+        ramp_len=FEEDRATE_RAMP_LEN,  # global ramp length
+    )
+    data_bt_string = ''.join(lines_smoothed)
+
     # 5) Save final backtransformed code
     os.makedirs(out_dir, exist_ok=True)
     file_name = os.path.basename(in_file)
     output_path = os.path.join(out_dir, file_name)
     with open(output_path, 'w', newline="\n", encoding='utf-8') as f_gcode_bt:
         f_gcode_bt.write(data_bt_string)
+
 
     end = time.time()
     print('GCode generated in {:.1f}s, saved in {}'.format(end - start, output_path))
