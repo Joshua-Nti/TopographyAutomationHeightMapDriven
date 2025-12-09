@@ -168,7 +168,7 @@ def transformSTL(in_body, in_transform, out_dir,
     # ---------------------------------------------------------
     print("[transformSTL]   Applying ridge-smoothing (Gaussian blur σ=3.0)")
     mask_zero = supported.copy()
-    DZ_smooth = gaussian_filter(DZ, sigma=10)
+    DZ_smooth = gaussian_filter(DZ, sigma=4.0)
     DZ_smooth[mask_zero] = 0.0
     DZ = DZ_smooth
     # ---------------------------------------------------------
