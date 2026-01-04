@@ -94,7 +94,7 @@ def _smoothstep_cos(t):
 
 # ---------------- main API ----------------
 
-def transformSTL(in_body, in_transform, out_dir,
+def transformSTL(in_body, in_transform, out_dir, heightmap_dir,
                  grid_nx=420, grid_ny=420,
                  z_tol=0.05, angle_deg=20.0,
                  blend_mm=0.35, margin_mm=0.0):
@@ -174,11 +174,11 @@ def transformSTL(in_body, in_transform, out_dir,
     # ---------------------------------------------------------
 
     # ---------------- SAVE HEIGHTMAP ----------------
-    vis_folder = os.path.join("heightmaps")
-    os.makedirs(vis_folder, exist_ok=True)
+    # vis_folder = os.path.join("heightmaps")
+    os.makedirs(heightmap_dir, exist_ok=True)
 
     base_name = os.path.splitext(os.path.basename(in_body))[0]
-    npz_path = os.path.join(vis_folder, f"{base_name}_heightmap.npz")
+    npz_path = os.path.join(heightmap_dir, f"{base_name}_heightmap.npz")
 
     np.savez_compressed(
         npz_path,
