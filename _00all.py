@@ -26,17 +26,17 @@ DEFAULT_INPUT = "test.stl"
 # --------------------------------------------------------------------------
 #  UTILS
 # --------------------------------------------------------------------------
-def purge_heightmaps():
+def purge_heightmaps(heightmap_dir):
     """
-    Delete the entire 'heightmaps/' folder before a new run.
+    Delete the entire heightmaps folder before a new run.
     Ensures no stale files conflict when the input model changes.
     """
-    heightmap_dir = "heightmaps"
     if os.path.isdir(heightmap_dir):
-        print("[PIPELINE] Purging old heightmaps/ folder...")
+        print(f"[PIPELINE] Purging old {heightmap_dir} ...")
         shutil.rmtree(heightmap_dir)
+
     os.makedirs(heightmap_dir, exist_ok=True)
-    print("[PIPELINE] Fresh heightmaps/ ready.")
+    print(f"[PIPELINE] Fresh {heightmap_dir} ready.")
 
 
 def _clear_folder(path):
@@ -141,7 +141,7 @@ def _backtransform_and_slowdown(
         grid_nx=420,
         grid_ny=420,
         z_tol=0.05,
-        angle_deg=20.0,
+        angle_deg=30.0,
         blend_mm=0.35,
         margin_mm=0.0,
     )
@@ -233,10 +233,11 @@ def sliceTransform(
             in_body=stl_part,
             in_transform=None,      # ignored in column-freeze mode
             out_dir=folder["stl_tf"],
+            heightmap_dir=folder["heightmaps"],
             grid_nx=420,
             grid_ny=420,
             z_tol=0.05,
-            angle_deg=20.0,
+            angle_deg=30.0,
             blend_mm=0.35,
             margin_mm=0.0,
         )
@@ -327,9 +328,9 @@ def sliceAll(folder: dict, segment_flags=None):
 
 def main(input_stl: str):
 
-    purge_heightmaps()
     base = os.path.splitext(os.path.basename(input_stl))[0]
     folders = make_folder_dict(base)
+    purge_heightmaps(folders["heightmaps"])
 
     print("\n=== Creating pipeline folders ===")
     createFoldersIfMissing(folders)

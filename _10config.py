@@ -78,6 +78,7 @@ def make_folder_dict(base_name):
         "tf_surfaces":  os.path.join(root_dir, "tf_surfaces"),
         "gcode_tf":     os.path.join(root_dir, "gcode_tf"),
         "gcode_parts":  os.path.join(root_dir, "gcode_parts"),
+        "heightmaps":   os.path.join(root_dir, "heightmaps"),
     }
 
 
