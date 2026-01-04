@@ -35,7 +35,7 @@ from scipy.ndimage import distance_transform_edt as edt
 # Max segment length (XY) for pre-segmentation of test_4.gcode.
 # This only affects test/gcode_parts/test_4.gcode.
 PRESEG_MAX_LEN = 0.25
-SEGMENT_TOGGLE = False
+SEGMENT_TOGGLE = True
 
 # Global ramp length for feedrate transitions (number of motion lines
 # used to smooth fast->slow and slow->fast feedrate jumps).
