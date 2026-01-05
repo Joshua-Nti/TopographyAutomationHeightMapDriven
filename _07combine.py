@@ -1,5 +1,6 @@
-# _07combine.py  (segment-local safe seam travel)
+# _07combine.py  (segment-local safe seam travel)  — FIXED: natural numeric ordering
 import os
+import re
 
 DEFAULT_TRAVEL_FEEDRATE = 6000.0   # fallback if nothing else is found
 
@@ -7,6 +8,31 @@ DEFAULT_TRAVEL_FEEDRATE = 6000.0   # fallback if nothing else is found
 # --------------------------------------------------------------
 # HELPERS
 # --------------------------------------------------------------
+
+def _natural_key(filename: str):
+    """
+    Numeric-aware ordering so:
+      test_1.gcode, test_2.gcode, ... test_10.gcode, test_11.gcode
+    instead of lexicographic:
+      test_1.gcode, test_10.gcode, test_11.gcode, test_2.gcode, ...
+    """
+    base = os.path.splitext(os.path.basename(filename))[0]
+
+    # Prefer trailing digits (common pattern: *_<n>)
+    m = re.search(r'(\d+)$', base)
+    if m:
+        prefix = base[:m.start(1)]
+        return (prefix, int(m.group(1)))
+
+    # Fallback: first digits anywhere
+    m2 = re.search(r'(\d+)', base)
+    if m2:
+        prefix = base[:m2.start(1)]
+        return (prefix, int(m2.group(1)))
+
+    # No digits: keep stable by name after numbered ones
+    return (base, float("inf"))
+
 
 def _find_payload_start_index(lines):
     """Find index of first real printing ';TYPE:' line."""
@@ -151,6 +177,7 @@ def combineGCode(in_folder, out_file, context_lines_before_type=2):
           - use that segment's own first F (e.g. 1200 / 1800) as seam travel speed
           - if none exists, fall back to last global F, else DEFAULT_TRAVEL_FEEDRATE
       ✔ remove rogue F-only and E-only lines before first XY
+      ✔ FIXED ORDER: numeric-aware sorting (1,2,3,...,10,11) not (1,10,11,2,...)
     """
 
     in_folder_abs = os.path.abspath(in_folder)
@@ -163,7 +190,10 @@ def combineGCode(in_folder, out_file, context_lines_before_type=2):
         f for f in os.listdir(in_folder_abs)
         if f.lower().endswith(".gcode") and not f.startswith(".")
     ]
-    gcode_files.sort()
+
+    # --- FIX: numeric-aware order ---
+    gcode_files.sort(key=_natural_key)
+
     print("[combineGCode] Order:", gcode_files)
 
     last_feedrate = None   # global modal feedrate across segments
