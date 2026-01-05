@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D)
 
-HEIGHTMAP_DIR = "heightmaps"
+HEIGHTMAP_DIR = "test/heightmaps"
 
 # Try to use scikit-image for smooth contours; fall back gracefully if missing
 try:

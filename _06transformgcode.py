@@ -1,45 +1,45 @@
 # _06transformgcode.py
 # Reverse-transform G-code sliced from a HEIGHTMAP-deformed STL back to printer space,
-# using the same column-freeze heightmap math as heightmap_gen.py.
+# now using the STORED heightmap (*.npz) produced by _04transformstl.py
+# instead of recomputing the heightmap (no EDT rebuild here).
 #
 # Behavior:
 #  - For most models: original stable behavior
 #       * XY segmentation in backtransform_data (maximal_length)
 #       * slowdown on downward-facing perimeters
-#  - For ONE specific file: test/gcode_parts/test_2.gcode
+#  - For selected files:
 #       * Pre-segmentation of XY moves BEFORE reverse mapping
 #       * Internal segmentation in backtransform_data effectively disabled
 #
 # Inputs:
 #   - in_file: G-code produced by slicing the DEFORMED mesh
-#   - stl_for_heightmap: ORIGINAL (pre-deformation) STL used to rebuild Δz(x,y)
+#   - heightmap_npz: saved heightmap file from transformSTL (e.g. test/heightmaps/<base>_heightmap.npz)
 #   - surface_for_slowdown: FINAL geometry STL (for downward perimeter slowdown)
 #
 # Outputs:
 #   - Writes backtransformed G-code to out_dir with the same basename
 #
-# Dependencies: numpy, numpy-stl, scipy.ndimage (for EDT)
+# Dependencies: numpy, numpy-stl (slowdown only), scipy not needed for heightmap anymore
 
 import re
 import os
 import time
 import math
 import numpy as np
-from stl import mesh
-from scipy.ndimage import distance_transform_edt as edt
+from stl import mesh  # only used for slowdown triangle extraction
+
 
 # ---------------------------------------------------------------------------
 #  CONFIG: which file gets pre-segmentation
 # ---------------------------------------------------------------------------
 
-# Max segment length (XY) for pre-segmentation of test_4.gcode.
-# This only affects test/gcode_parts/test_4.gcode.
 PRESEG_MAX_LEN = 0.25
 SEGMENT_TOGGLE = True
 
 # Global ramp length for feedrate transitions (number of motion lines
 # used to smooth fast->slow and slow->fast feedrate jumps).
-FEEDRATE_RAMP_LEN = 7  # you can set this to 3, 5, 7, ...
+FEEDRATE_RAMP_LEN = 7
+
 
 def _should_presegment(in_file: str) -> bool:
     """
@@ -52,14 +52,12 @@ def _should_presegment(in_file: str) -> bool:
     """
     norm_path = os.path.normpath(os.path.abspath(in_file))
 
-    # --- Exact tails we want to match ---
     TARGET_TAILS = [
         os.path.normpath(os.path.join("test", "gcode_tf", "test_2.gcode")),
         os.path.normpath(os.path.join("test", "gcode_tf", "test_4.gcode")),
         os.path.normpath(os.path.join("test", "gcode_tf", "test_5.gcode")),
     ]
 
-    # Check if this file matches any exact tail
     for tail in TARGET_TAILS:
         if norm_path.endswith(tail):
             print(f"[transformGCode] Pre-segmentation ENABLED for {tail}")
@@ -69,75 +67,101 @@ def _should_presegment(in_file: str) -> bool:
     return False
 
 
-
-
 # ---------------------------------------------------------------------------
-# Heightmap (column-freeze) utilities — SAME MATH AS heightmap_gen.py
+# Heightmap utilities — LOAD STORED HEIGHTMAP (NO RECOMPUTE)
 # ---------------------------------------------------------------------------
 
-def grid_over_bbox(xmin, xmax, ymin, ymax, nx, ny):
-    xs = np.linspace(xmin, xmax, nx)
-    ys = np.linspace(ymin, ymax, ny)
-    return np.meshgrid(xs, ys)
-
-
-def rasterize_supported_mask(triangles_xyz, X, Y, zmin, z_tol):
+def _normalize_xy_to_meshgrid(X, Y, DZ):
     """
-    Boolean mask of supported (True) cells over (X,Y).
-    Supported triangles are those with mean(z) <= zmin + z_tol.
+    Ensure X,Y are 2D meshgrids matching DZ.
+    Supports:
+      - X,Y already 2D arrays matching DZ
+      - X,Y as 1D vectors (will meshgrid)
     """
-    inside = np.zeros(X.shape, dtype=bool)
+    X = np.asarray(X)
+    Y = np.asarray(Y)
+    DZ = np.asarray(DZ)
 
-    dx = (X[0, 1] - X[0, 0]) if X.shape[1] > 1 else 1.0
-    dy = (Y[1, 0] - Y[0, 0]) if X.shape[0] > 1 else 1.0
-    x0, y0 = X[0, 0], Y[0, 0]
-    nx = X.shape[1]
-    ny = X.shape[0]
+    if X.ndim == 2 and Y.ndim == 2 and X.shape == DZ.shape and Y.shape == DZ.shape:
+        return X, Y, DZ
 
-    tri = triangles_xyz  # (T,3,3)
-    mean_z = tri[:, :, 2].mean(axis=1)
-    sup_tris = tri[mean_z <= (zmin + z_tol)]
-    if sup_tris.shape[0] == 0:
-        return inside  # empty
+    if X.ndim == 1 and Y.ndim == 1:
+        XX, YY = np.meshgrid(X, Y)
+        if XX.shape != DZ.shape:
+            raise ValueError(
+                f"Heightmap shape mismatch: DZ.shape={DZ.shape} but meshgrid(X,Y).shape={XX.shape}"
+            )
+        return XX, YY, DZ
 
-    for t in sup_tris:
-        x = t[:, 0]
-        y = t[:, 1]
-        xmin_t = float(x.min())
-        xmax_t = float(x.max())
-        ymin_t = float(y.min())
-        ymax_t = float(y.max())
+    raise ValueError(
+        f"Unsupported heightmap shapes: X.shape={X.shape}, Y.shape={Y.shape}, DZ.shape={DZ.shape}"
+    )
 
-        # compute grid window
-        i0 = int(np.clip(np.floor((xmin_t - x0) / dx), 0, nx - 1))
-        i1 = int(np.clip(np.ceil((xmax_t - x0) / dx), 0, nx - 1))
-        j0 = int(np.clip(np.floor((ymin_t - y0) / dy), 0, ny - 1))
-        j1 = int(np.clip(np.ceil((ymax_t - y0) / dy), 0, ny - 1))
-        if i1 < i0 or j1 < j0:
-            continue
 
-        # barycentric inclusion on subgrid
-        p0 = np.array([x[0], y[0]])
-        p1 = np.array([x[1], y[1]])
-        p2 = np.array([x[2], y[2]])
-        v0 = p2 - p0
-        v1 = p1 - p0
-        denom = (v0[0] * v1[1] - v0[1] * v1[0])
-        if abs(denom) < 1e-12:
-            continue
-        inv_d = 1.0 / denom
+def load_heightmap_npz(heightmap_npz: str):
+    """
+    Load stored heightmap from _04transformstl.py output NPZ:
+      - X, Y (grid)
+      - DZ (heightmap)
+      - supported (mask)
+      - xmin, ymin, dx, dy (grid metadata)
 
-        subX = X[j0:j1 + 1, i0:i1 + 1]
-        subY = Y[j0:j1 + 1, i0:i1 + 1]
-        qx = subX - p0[0]
-        qy = subY - p0[1]
-        u = (qx * v1[1] - qy * v1[0]) * inv_d
-        v = (qy * v0[0] - qx * v0[1]) * inv_d
-        w = 1.0 - u - v
-        mask = (u >= 0) & (v >= 0) & (w >= 0)
-        inside[j0:j1 + 1, i0:i1 + 1] |= mask
+    Returns:
+      xmin, ymin, dx, dy, DZ, supported, X, Y
+    """
+    if not os.path.isfile(heightmap_npz):
+        raise FileNotFoundError(f"Heightmap NPZ not found: {heightmap_npz}")
 
-    return inside
+    with np.load(heightmap_npz, allow_pickle=False) as data:
+        keys = set(data.files)
+
+        def pick(*cands):
+            for k in cands:
+                if k in keys:
+                    return data[k]
+            return None
+
+        X = pick("X", "x", "XX")
+        Y = pick("Y", "y", "YY")
+        DZ = pick("DZ", "dz", "dZ", "deltaZ", "DeltaZ")
+        supported = pick("supported", "mask", "footprint", "inside_mask", "valid", "inside")
+
+        xmin = pick("xmin")
+        ymin = pick("ymin")
+        dx = pick("dx")
+        dy = pick("dy")
+
+        if X is None or Y is None or DZ is None:
+            raise KeyError(
+                f"Heightmap NPZ missing required keys. Expected at least X, Y, DZ. Found: {sorted(keys)}"
+            )
+
+        if supported is None:
+            # If not present, derive supported from DZ == 0 (works for your pipeline)
+            supported = (np.asarray(DZ) == 0.0)
+
+        if xmin is None or ymin is None or dx is None or dy is None:
+            # Derive from X,Y if metadata missing (still works)
+            Xn, Yn, DZn = _normalize_xy_to_meshgrid(X, Y, DZ)
+            xmin = float(np.min(Xn))
+            ymin = float(np.min(Yn))
+            # Assuming uniform grid
+            dx = float(Xn[0, 1] - Xn[0, 0]) if Xn.shape[1] > 1 else 1.0
+            dy = float(Yn[1, 0] - Yn[0, 0]) if Yn.shape[0] > 1 else 1.0
+            X, Y, DZ = Xn, Yn, DZn
+        else:
+            xmin = float(xmin)
+            ymin = float(ymin)
+            dx = float(dx)
+            dy = float(dy)
+            X, Y, DZ = _normalize_xy_to_meshgrid(X, Y, DZ)
+
+        supported = np.asarray(supported).astype(bool)
+        if supported.shape != DZ.shape:
+            # last-resort: derive from DZ==0
+            supported = (np.asarray(DZ) == 0.0)
+
+        return xmin, ymin, dx, dy, np.asarray(DZ, dtype=float), supported, X, Y
 
 
 def bilinear_sample(Z, x, y, xmin, ymin, dx, dy):
@@ -168,49 +192,11 @@ def bilinear_sample(Z, x, y, xmin, ymin, dx, dy):
     return z0 * (1 - fv) + z1 * fv
 
 
-def smoothstep_cos(t):
-    t = np.clip(t, 0.0, 1.0)
-    return 0.5 - 0.5 * math.cos(math.pi * t)
-
-
-def build_heightmap_field(in_stl, grid_nx, grid_ny, z_tol, angle_deg, blend_mm, margin_mm):
+def dz_at_from_saved_heightmap(x, y, xmin, ymin, dx, dy, DZ, supported):
     """
-    Rebuild Δz(x,y) field: supported mask -> outside distance field -> Δz components.
-    Returns: (xmin, ymin, dx, dy, dist_out, supported, sin(angle), blend)
+    Compute Δz(x,y) directly from the STORED DZ field.
+    Column-freeze behavior is preserved by returning 0 inside supported footprint.
     """
-    m_in = mesh.Mesh.from_file(in_stl)
-    Vtri = m_in.vectors.copy()  # (T,3,3)
-    V = Vtri.reshape(-1, 3)      # (N,3)
-
-    xmin = float(V[:, 0].min())
-    xmax = float(V[:, 0].max())
-    ymin = float(V[:, 1].min())
-    ymax = float(V[:, 1].max())
-    zmin = float(V[:, 2].min())
-
-    if margin_mm > 0:
-        xmin -= margin_mm
-        ymin -= margin_mm
-        xmax += margin_mm
-        ymax += margin_mm
-
-    X, Y = grid_over_bbox(xmin, xmax, ymin, ymax, int(grid_nx), int(grid_ny))
-    dx = (xmax - xmin) / max(int(grid_nx) - 1, 1)
-    dy = (ymax - ymin) / max(int(grid_ny) - 1, 1)
-
-    supported = rasterize_supported_mask(Vtri, X, Y, zmin, float(z_tol))
-    if not supported.any():
-        raise RuntimeError("No supported footprint found; try increasing z_tol.")
-
-    dist_out = edt(~supported, sampling=(dy, dx))
-    s = math.sin(math.radians(angle_deg))
-    blend = max(1e-6, float(blend_mm))
-    return xmin, ymin, dx, dy, dist_out, supported, s, blend
-
-
-def dz_at(x, y, xmin, ymin, dx, dy, dist_out, supported, s, blend):
-    """Compute Δz(x,y) with column-freeze (0 inside supported footprint)."""
-    # freeze: nearest-cell lookup in supported mask
     u = int(round((x - xmin) / dx))
     v = int(round((y - ymin) / dy))
     ny, nx = supported.shape
@@ -219,9 +205,7 @@ def dz_at(x, y, xmin, ymin, dx, dy, dist_out, supported, s, blend):
     if supported[v, u]:
         return 0.0
 
-    d = bilinear_sample(dist_out, x, y, xmin, ymin, dx, dy)
-    w = smoothstep_cos(d / blend)
-    return (d * s) * w
+    return float(bilinear_sample(DZ, x, y, xmin, ymin, dx, dy))
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +282,6 @@ def query_triangles_near_point(p, grid, cell_size):
     ix = int(np.floor(x / cell_size))
     iy = int(np.floor(y / cell_size))
     iz = int(np.floor(z / cell_size))
-    # 1-cell neighborhood is enough for speed (can expand if needed)
     candidates = []
     key = (ix, iy, iz)
     if key in grid:
@@ -355,7 +338,7 @@ def segment_near_downward_surface(p_start, p_mid, p_end, tri_grid, cell_size, di
 
 
 # ---------------------------------------------------------------------------
-# G-code helpers (unchanged from stable pipeline)
+# G-code helpers (unchanged)
 # ---------------------------------------------------------------------------
 
 def insert_Z(row, z_value):
@@ -363,7 +346,6 @@ def insert_Z(row, z_value):
     m = re.search(pattern_Z, row)
     if m is not None:
         return re.sub(pattern_Z, ' Z' + str(round(z_value, 3)), row)
-    # else insert after Y or X if present
     mY = re.search(r'Y[-0-9.]+[.]?[0-9]*', row)
     mX = re.search(r'X[-0-9.]+[.]?[0-9]*', row)
     if mY is not None:
@@ -403,55 +385,25 @@ def extract_feedrate(row):
         return None
 
 
-
 def smooth_feedrate_transitions(lines, slow_feedrate, ramp_len=None):
-    """
-    Post-process a list of G-code lines and smooth abrupt feedrate jumps
-
-    1) FAST -> SLOW (deceleration):
-       - Detect transitions from a higher feedrate down to `slow_feedrate`.
-       - Apply a backward ramp over up to `ramp_len` motion lines
-         (previous lines + the first slow line).
-       - This keeps the slow region itself at `slow_feedrate`.
-
-    2) SLOW -> FAST (acceleration):
-       - Detect transitions from `slow_feedrate` to a higher feedrate.
-       - If there is another explicit slow feedrate soon after (within about
-         2 * ramp_len motion lines), we SKIP the acceleration ramp and let the
-         later deceleration ramp handle the transition.
-       - Otherwise, apply a forward ramp over up to `ramp_len` motion lines
-         (starting at the first faster line).
-
-    If ramp_len is None, FEEDRATE_RAMP_LEN is used.
-    """
     if ramp_len is None:
         ramp_len = FEEDRATE_RAMP_LEN
 
     EPS = 1e-6
-
-    # Work on a modifiable copy
     out = list(lines)
 
-    # ----------------------------------------------------------------------
-    # PASS 1: FAST -> SLOW (backward ramp)
-    # ----------------------------------------------------------------------
+    # PASS 1: FAST -> SLOW
     last_F = None
-
     for i in range(len(out)):
         line = out[i]
         F_here = extract_feedrate(line)
-
         if F_here is not None:
-            # Detect jump from fast -> exactly slow_feedrate
             if (
                 last_F is not None
                 and last_F > slow_feedrate + EPS
                 and abs(F_here - slow_feedrate) < EPS
             ):
-                # We want to ramp backwards over up to 'ramp_len' motion lines:
-                # some previous G0/G1 lines (fast) + this first slow line.
                 ramp_indices = []
-
                 j = i
                 while j >= 0 and len(ramp_indices) < ramp_len:
                     l_j = out[j]
@@ -460,31 +412,23 @@ def smooth_feedrate_transitions(lines, slow_feedrate, ramp_len=None):
                         ramp_indices.append(j)
                     j -= 1
 
-                # ramp_indices currently in descending order -> sort ascending
                 ramp_indices.sort()
                 total = len(ramp_indices)
 
                 if total > 0:
                     F_start = last_F
                     F_target = slow_feedrate
-
                     for k, idx in enumerate(ramp_indices):
-                        t = float(k + 1) / float(total)  # 1/total .. 1
+                        t = float(k + 1) / float(total)
                         F_k = F_start + (F_target - F_start) * t
                         out[idx] = clean_and_set_feedrate(out[idx], F_k)
-
-                    # After the ramp, effective feedrate is slow
                     last_F = slow_feedrate
                 else:
-                    # No valid motion lines found; just keep the explicit slow feed
                     last_F = F_here
             else:
-                # Normal update of last_F
                 last_F = F_here
 
-    # ----------------------------------------------------------------------
-    # PASS 2: SLOW -> FAST (forward ramp with lookahead)
-    # ----------------------------------------------------------------------
+    # PASS 2: SLOW -> FAST
     result = out
     last_F = None
     i = 0
@@ -495,14 +439,11 @@ def smooth_feedrate_transitions(lines, slow_feedrate, ramp_len=None):
         F_here = extract_feedrate(line)
 
         if F_here is not None:
-            # Detect jump from slow -> faster
             if (
                 last_F is not None
                 and abs(last_F - slow_feedrate) < EPS
                 and F_here > slow_feedrate + EPS
             ):
-                # Look ahead: is there another explicit slow feedrate
-                # within about 2 * ramp_len motion lines?
                 motion_seen = 0
                 next_slow_index = None
                 j = i + 1
@@ -519,17 +460,11 @@ def smooth_feedrate_transitions(lines, slow_feedrate, ramp_len=None):
                     j += 1
 
                 if next_slow_index is not None and motion_seen < 2 * ramp_len:
-                    # Not enough room for a full accel ramp AND a clean decel
-                    # ramp before the next slow region.
-                    # In this case, we KEEP the slow speed and do NOT jump up:
-                    # overwrite this faster F with slow_feedrate.
                     result[i] = clean_and_set_feedrate(result[i], slow_feedrate)
                     last_F = slow_feedrate
                     i += 1
                     continue
 
-
-                # Otherwise: perform normal forward ramp from slow -> F_here
                 F_start = slow_feedrate
                 F_target = F_here
 
@@ -545,7 +480,7 @@ def smooth_feedrate_transitions(lines, slow_feedrate, ramp_len=None):
                 total = len(ramp_indices)
                 if total > 0:
                     for k, idx in enumerate(ramp_indices):
-                        t = float(k + 1) / float(total)  # 1/total .. 1
+                        t = float(k + 1) / float(total)
                         F_k = F_start + (F_target - F_start) * t
                         result[idx] = clean_and_set_feedrate(result[idx], F_k)
 
@@ -553,43 +488,33 @@ def smooth_feedrate_transitions(lines, slow_feedrate, ramp_len=None):
                     i = ramp_indices[-1] + 1
                     continue
                 else:
-                    # No motion lines to ramp; just set the faster feed here
                     result[i] = clean_and_set_feedrate(result[i], F_target)
                     last_F = F_target
                     i += 1
                     continue
             else:
-                # Normal explicit feedrate update (no ramp)
                 last_F = F_here
 
-        # No feedrate on this line, keep last_F as-is
         i += 1
 
     return result
 
 
-
 # ---------------------------------------------------------------------------
-# Core: backtransform_data using HEIGHTMAP Δz(x,y)
+# Core: backtransform_data using STORED HEIGHTMAP DZ
 # ---------------------------------------------------------------------------
 
 def backtransform_data(
     data,
     zmin_clamp,
     maximal_length,
-    # heightmap field components:
-    xmin, ymin, dx, dy, dist_out, supported, s, blend,
+    # heightmap field components (loaded from NPZ):
+    xmin, ymin, dx, dy, DZ, supported,
     # slowdown geometry:
     tri_grid,
     cell_size,
     slow_feedrate=180.0
 ):
-    """
-    Convert deformed-space G-code 'data' into final printer-space toolpaths.
-    - Rewrites Z as Z := Z - Δz(x,y) using the provided heightmap field.
-    - Segments long XY moves (unless maximal_length is huge, e.g. for test_2.gcode).
-    - Perimeter slowdown on downward-facing geometry.
-    """
     new_data = []
 
     pattern_X = r'X[-0-9.]+[.]?[0-9]*'
@@ -634,7 +559,7 @@ def backtransform_data(
             new_data.append(row)
             continue
 
-        # Move line (G0/G1 ... )
+        # Move line
         x_match = re.search(pattern_X, row)
         y_match = re.search(pattern_Y, row)
         z_match = re.search(pattern_Z, row)
@@ -667,13 +592,12 @@ def backtransform_data(
         x_vals = np.linspace(x_old, x_new, num_segm + 1)
         y_vals = np.linspace(y_old, y_new, num_segm + 1)
 
-        # Compute final Z for each segment endpoint: Z := max(z_layer - Δz(x,y), zmin)
+        # Z := max(z_layer - DZ(x,y), zmin)
         z_vals = np.empty(num_segm + 1, dtype=float)
         for i, (xx, yy) in enumerate(zip(x_vals, y_vals)):
-            delta_z = dz_at(xx, yy, xmin, ymin, dx, dy, dist_out, supported, s, blend)
+            delta_z = dz_at_from_saved_heightmap(xx, yy, xmin, ymin, dx, dy, DZ, supported)
             z_vals[i] = max(z_layer - delta_z, zmin_clamp)
 
-        # Base row: inject starting Z and rescale E across subsegments
         base_row = insert_Z(row, z_vals[0])
         base_row = replace_E(base_row, num_segm)
 
@@ -684,7 +608,6 @@ def backtransform_data(
             sub_y = y_vals[j + 1]
             sub_z = z_vals[j + 1]
 
-            # Build one sub-move
             single_row = re.sub(pattern_X, 'X' + str(round(sub_x, 3)), base_row)
             single_row = re.sub(pattern_Y, 'Y' + str(round(sub_y, 3)), single_row)
             single_row = re.sub(pattern_Z, 'Z' + str(round(sub_z, 3)), single_row)
@@ -743,12 +666,10 @@ def backtransform_data(
             replacement_rows += single_row
             total_subsegments += 1
 
-        # update XY
         x_old = x_new
         y_old = y_new
         new_data.append(replacement_rows)
 
-    # Debug
     print("=== DEBUG backtransform_data ===")
     print("perimeter_true_count:", perimeter_true_count)
     print("total_subsegments:", total_subsegments)
@@ -759,19 +680,10 @@ def backtransform_data(
 
 
 # ---------------------------------------------------------------------------
-# Pre-segmentation of G-code moves (ONLY for test_2.gcode)
+# Pre-segmentation of G-code moves (for selected files)
 # ---------------------------------------------------------------------------
 
 def pre_subdivide_gcode_moves(data, max_seg_len=0.15):
-    """
-    Pre-subdivide XY moves in raw slicer G-code BEFORE applying reverse deformation.
-
-    This is used ONLY for test/gcode_parts/test_2.gcode.
-
-    Assumes RELATIVE extrusion (M83): each motion line's E value is an increment.
-    That increment is split evenly across subsegments.
-    """
-
     out = []
 
     pat_cmd = re.compile(r'^(G0|G1)\s')
@@ -785,7 +697,6 @@ def pre_subdivide_gcode_moves(data, max_seg_len=0.15):
     for row in data:
         stripped = row.strip()
 
-        # Pass non G0/G1 lines unchanged
         if not pat_cmd.match(stripped):
             out.append(row)
             continue
@@ -794,7 +705,6 @@ def pre_subdivide_gcode_moves(data, max_seg_len=0.15):
         mY = patY.search(row)
         mE = patE.search(row)
 
-        # If no XY on this line, keep as-is
         if mX is None and mY is None:
             out.append(row)
             continue
@@ -802,7 +712,6 @@ def pre_subdivide_gcode_moves(data, max_seg_len=0.15):
         x_new = x_old if mX is None and x_old is not None else (float(mX.group(1)) if mX is not None else None)
         y_new = y_old if mY is None and y_old is not None else (float(mY.group(1)) if mY is not None else None)
 
-        # First XY occurrence: just record and pass through
         if x_old is None or y_old is None or x_new is None or y_new is None:
             out.append(row)
             x_old = x_new
@@ -811,14 +720,12 @@ def pre_subdivide_gcode_moves(data, max_seg_len=0.15):
 
         dist = math.hypot(x_new - x_old, y_new - y_old)
 
-        # No subdivision needed
         if dist <= max_seg_len or max_seg_len <= 0:
             out.append(row)
             x_old = x_new
             y_old = y_new
             continue
 
-        # Need subdivision
         N = int(math.ceil(dist / max_seg_len))
         xs = np.linspace(x_old, x_new, N + 1)
         ys = np.linspace(y_old, y_new, N + 1)
@@ -831,7 +738,6 @@ def pre_subdivide_gcode_moves(data, max_seg_len=0.15):
             yi = ys[i]
             new_line = row
 
-            # Replace X/Y
             if mX is not None:
                 new_line = patX.sub(f"X{xi:.3f}", new_line)
             else:
@@ -842,7 +748,6 @@ def pre_subdivide_gcode_moves(data, max_seg_len=0.15):
             else:
                 new_line = new_line.rstrip() + f" Y{yi:.3f}"
 
-            # Split extrusion
             if mE is not None and e_per is not None:
                 new_line = patE.sub(f"E{e_per:.5f}", new_line)
 
@@ -859,12 +764,12 @@ def pre_subdivide_gcode_moves(data, max_seg_len=0.15):
 
 
 # ---------------------------------------------------------------------------
-# Public entry: transformGCode (HEIGHTMAP version)
+# Public entry: transformGCode (HEIGHTMAP version, using stored NPZ)
 # ---------------------------------------------------------------------------
 
 def transformGCode(
     in_file: str,
-    stl_for_heightmap: str,
+    heightmap_npz: str,
     out_dir: str,
     surface_for_slowdown: str,
     maximal_length: float = 1.0,
@@ -873,26 +778,14 @@ def transformGCode(
     z_desired: float = 0.1,
     downward_angle_deg: float = 10.0,
     slow_feedrate: float = 180.0,
-    # HEIGHTMAP params (must match the ones used during deformation):
-    grid_nx: int = 420,
-    grid_ny: int = 420,
-    z_tol: float = 0.05,
-    angle_deg: float = 20.0,
-    blend_mm: float = 0.35,
-    margin_mm: float = 0.0
 ):
     """
     Reverse-transform G-code sliced from a HEIGHTMAP-deformed mesh back to printer space.
 
     in_file            : path to G-code sliced from the DEFORMED STL
-    stl_for_heightmap  : ORIGINAL (pre-deformation) STL used to rebuild Δz(x,y)
+    heightmap_npz      : stored NPZ from transformSTL (contains DZ + grid metadata)
     out_dir            : output directory for final G-code
     surface_for_slowdown : FINAL geometry STL for downward-facing slowdown detection
-
-    For most files: original stable behavior.
-    For test/gcode_parts/test_2.gcode:
-        - pre-segmentation before reverse mapping
-        - internal segmentation disabled by setting maximal_length huge.
     """
     start = time.time()
 
@@ -900,41 +793,41 @@ def transformGCode(
     with open(in_file, 'r', encoding='utf-8', errors='ignore') as f_gcode:
         data = f_gcode.readlines()
 
-    # 1b) Optional pre-segmentation ONLY for test_2.gcode
+    # 1b) Optional pre-segmentation
     use_preseg = _should_presegment(in_file)
     if use_preseg:
         data = pre_subdivide_gcode_moves(data, max_seg_len=PRESEG_MAX_LEN)
-        internal_max_length = 1e9  # effectively disable further segmentation
+        internal_max_length = 1e9
     else:
         internal_max_length = maximal_length
 
-    # 2) Build Δz field from ORIGINAL STL with the SAME params used in heightmap_gen.py
-    xmin, ymin, dx, dy, dist_out, supported, s, blend = build_heightmap_field(
-        stl_for_heightmap, grid_nx, grid_ny, z_tol, angle_deg, blend_mm, margin_mm
-    )
+    # 2) LOAD STORED HEIGHTMAP (no recompute)
+    xmin, ymin, dx, dy, DZ, supported, _, _ = load_heightmap_npz(heightmap_npz)
+    print(f"[transformGCode] Using stored heightmap: {heightmap_npz}")
+    print(f"[transformGCode]   grid: {DZ.shape[1]}x{DZ.shape[0]}  dx={dx:.6f}  dy={dy:.6f}")
 
     # 3) Build slowdown geometry index from FINAL geometry STL
     downward_triangles = triangle_data_from_mesh(surface_for_slowdown, max_angle_deg=downward_angle_deg)
     tri_grid, cell_size = build_triangle_spatial_index(downward_triangles, cell_size=2.0)
 
-    # 4) Backtransform (rewrite Z) + slowdown
+    # 4) Backtransform Z + slowdown
     data_bt = backtransform_data(
         data=data,
-        zmin_clamp=z_desired + 0.2,   # same clamp convention as before
+        zmin_clamp=z_desired + 0.2,
         maximal_length=internal_max_length,
         xmin=xmin, ymin=ymin, dx=dx, dy=dy,
-        dist_out=dist_out, supported=supported, s=s, blend=blend,
+        DZ=DZ, supported=supported,
         tri_grid=tri_grid, cell_size=cell_size,
         slow_feedrate=slow_feedrate
     )
     data_bt_string = ''.join(data_bt)
 
-    # 4b) Smooth global feedrate transitions (fast <-> slow)
+    # 4b) Smooth global feedrate transitions
     lines = data_bt_string.splitlines(keepends=True)
     lines_smoothed = smooth_feedrate_transitions(
         lines,
         slow_feedrate=slow_feedrate,
-        ramp_len=FEEDRATE_RAMP_LEN,  # global ramp length
+        ramp_len=FEEDRATE_RAMP_LEN,
     )
     data_bt_string = ''.join(lines_smoothed)
 
@@ -944,7 +837,6 @@ def transformGCode(
     output_path = os.path.join(out_dir, file_name)
     with open(output_path, 'w', newline="\n", encoding='utf-8') as f_gcode_bt:
         f_gcode_bt.write(data_bt_string)
-
 
     end = time.time()
     print('GCode generated in {:.1f}s, saved in {}'.format(end - start, output_path))
@@ -956,21 +848,18 @@ def transformGCode(
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     # Example paths consistent with your structure
-    in_file             = os.path.join('gcode_tf', 'Body2.gcode')        # sliced from DEFORMED STL
-    stl_for_heightmap   = os.path.join('stl_parts', 'Body2.stl')         # ORIGINAL STL
-    surface_for_slowdown= os.path.join('stl_parts', 'Body2.stl')         # FINAL geometry for slowdown
-    out_dir             = 'gcode_parts'
+    in_file = os.path.join('test', 'gcode_tf', 'test_2.gcode')  # sliced from DEFORMED STL
+    heightmap_npz = os.path.join('test', 'heightmaps', 'test_2_heightmap.npz')  # from transformSTL
+    surface_for_slowdown = os.path.join('test', 'stl_tf', 'test_2.stl')  # FINAL geometry STL
+    out_dir = os.path.join('test', 'gcode_parts')
 
     transformGCode(
         in_file=in_file,
-        stl_for_heightmap=stl_for_heightmap,
+        heightmap_npz=heightmap_npz,
         out_dir=out_dir,
         surface_for_slowdown=surface_for_slowdown,
         maximal_length=0.5,
-        x_shift=0.0,
-        y_shift=0.0,
         z_desired=0.1,
         downward_angle_deg=10.0,
         slow_feedrate=180.0,
-        grid_nx=420, grid_ny=420, z_tol=0.05, angle_deg=20.0, blend_mm=0.35, margin_mm=0.0
     )

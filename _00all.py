@@ -109,15 +109,18 @@ def _backtransform_and_slowdown(
     gcode_in: str,
     coarse_stl_original: str,
     out_dir: str,
+    heightmap_dir: str,
 ) -> str:
     """
     Wrapper around transformGCode() so all numeric knobs live in one place.
 
     - gcode_in            : G-code sliced from the DEFORMED STL
     - coarse_stl_original : ORIGINAL segment geometry (unrefined) used to
-                            rebuild the heightmap Δz(x,y) AND to detect
-                            downward-facing surfaces for slowdown.
+                            (a) derive the stored heightmap filename
+                            (b) detect downward-facing surfaces for slowdown
     - out_dir             : where final printer-space G-code is written.
+    - heightmap_dir       : directory where transformSTL saved *_heightmap.npz
+                            (e.g. test/heightmaps/)
     """
 
     max_seg_len = GEOMETRY_CONFIG["maximal_segment_length_mm"]
@@ -126,24 +129,28 @@ def _backtransform_and_slowdown(
     z_min       = GEOMETRY_CONFIG["z_desired_min_mm"]
     xy_x, xy_y  = GEOMETRY_CONFIG["xy_backtransform_shift_mm"]
 
+    # Stored heightmap path: <heightmap_dir>/<basename>_heightmap.npz
+    base_name = os.path.splitext(os.path.basename(coarse_stl_original))[0]
+    heightmap_npz = os.path.join(heightmap_dir, f"{base_name}_heightmap.npz")
+
+    if not os.path.isfile(heightmap_npz):
+        raise FileNotFoundError(
+            f"[PIPELINE] Expected heightmap not found:\n"
+            f"  {heightmap_npz}\n"
+            f"Make sure transformSTL() ran and saved the NPZ into heightmap_dir."
+        )
+
     out_path = transformGCode(
         in_file=gcode_in,
-        stl_for_heightmap=coarse_stl_original,      # ORIGINAL pre-deform STL
+        heightmap_npz=heightmap_npz,              # <-- FIX: use stored NPZ
         out_dir=out_dir,
-        surface_for_slowdown=coarse_stl_original,   # FINAL geometry for slowdown
+        surface_for_slowdown=coarse_stl_original, # slowdown geometry source
         maximal_length=max_seg_len,
         x_shift=xy_x,
         y_shift=xy_y,
         z_desired=z_min,
         downward_angle_deg=down_angle,
         slow_feedrate=slow_feed,
-        # MUST match transformSTL:
-        grid_nx=420,
-        grid_ny=420,
-        z_tol=0.05,
-        angle_deg=30.0,
-        blend_mm=0.35,
-        margin_mm=0.0,
     )
     return out_path
 
@@ -258,6 +265,7 @@ def sliceTransform(
             gcode_in=gcode_tf,
             coarse_stl_original=stl_coarse,
             out_dir=folder["gcode_parts"],
+            heightmap_dir=folder["heightmaps"],     # <-- FIX: pass heightmap folder
         )
 
     # 5) PLANAR PATH  (no overhang OR forced planar bottom)
