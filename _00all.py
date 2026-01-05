@@ -142,7 +142,7 @@ def _backtransform_and_slowdown(
 
     out_path = transformGCode(
         in_file=gcode_in,
-        heightmap_npz=heightmap_npz,              # <-- FIX: use stored NPZ
+        heightmap_npz=heightmap_npz,              # use stored NPZ
         out_dir=out_dir,
         surface_for_slowdown=coarse_stl_original, # slowdown geometry source
         maximal_length=max_seg_len,
@@ -265,7 +265,7 @@ def sliceTransform(
             gcode_in=gcode_tf,
             coarse_stl_original=stl_coarse,
             out_dir=folder["gcode_parts"],
-            heightmap_dir=folder["heightmaps"],     # <-- FIX: pass heightmap folder
+            heightmap_dir=folder["heightmaps"],
         )
 
     # 5) PLANAR PATH  (no overhang OR forced planar bottom)
@@ -335,6 +335,7 @@ def sliceAll(folder: dict, segment_flags=None):
 # --------------------------------------------------------------------------
 
 def main(input_stl: str):
+    _pipeline_t0 = time.time()  # <-- TOTAL wall-time start
 
     base = os.path.splitext(os.path.basename(input_stl))[0]
     folders = make_folder_dict(base)
@@ -404,6 +405,13 @@ def main(input_stl: str):
 
     print("\n=== PIPELINE COMPLETE ===")
     print("Combined G-code (unshifted):", combined_path)
+
+    # <-- TOTAL wall-time end (printed last, after everything)
+    _pipeline_dt = time.time() - _pipeline_t0
+    if _pipeline_dt >= 60.0:
+        print(f"[TIMING] Total pipeline runtime: {_pipeline_dt/60.0:.2f} min ({_pipeline_dt:.1f} s)")
+    else:
+        print(f"[TIMING] Total pipeline runtime: {_pipeline_dt:.1f} s")
 
 
 if __name__ == "__main__":
