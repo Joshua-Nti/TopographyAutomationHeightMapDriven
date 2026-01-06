@@ -33,8 +33,8 @@ from stl import mesh  # only used for slowdown triangle extraction
 #  CONFIG: which file gets pre-segmentation
 # ---------------------------------------------------------------------------
 
-PRESEG_MAX_LEN = 0.25
-SEGMENT_TOGGLE = True
+PRESEG_MAX_LEN = 0.5
+SEGMENT_TOGGLE = False
 
 # Global ramp length for feedrate transitions (number of motion lines
 # used to smooth fast->slow and slow->fast feedrate jumps).
